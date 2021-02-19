@@ -3,10 +3,15 @@
 // Adrian Bulat,2017
 // ------------------------------------------------------------------
 
-#include "THC.h"
+//#include "THC.h"
+#include <THC/THC.h>
+#include <torch/torch.h>
 #include "common.h"
-#include "THCNumerics.cuh"
-#include "THCDeviceTensor.cuh"
+//#include "THCNumerics.cuh"
+//#include "THCDeviceTensor.cuh"
+#include <THC/THCNumerics.cuh>"
+#include <THC/THCDeviceTensor.cuh>"
+#include <c10/cuda/CUDAStream.h>"
 
 #include <iostream>
 
@@ -257,7 +262,8 @@ void encode_rows(THCState *state, THCudaTensor* input, THCudaIntTensor* output) 
 
       int count = THCudaIntTensor_nElement(state, output);
 			
-      encode_rows_kernel <<< GET_BLOCKS(count), CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state) >>>(
+	  cudaStream_t   stream = at::cuda::getCurrentCUDAStream().stream();
+      encode_rows_kernel <<< GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream>>>(
             THCudaTensor_data(state, input),
             (unsigned int*)THCudaIntTensor_data(state, output),
             count);
@@ -267,14 +273,15 @@ extern "C"
 void encode_cols(THCState *state, THCudaTensor* input, THCudaIntTensor* output) {
       THCUNN_assertSameGPU(state, 2, input, output);
 
-	  int n = input->size[0];
-	  int k = input->size[1];
+	  int n = input->size(0);
+	  int k = input->size(1);
 	  
 	  dim3 blockDim(32, 32, 1);
       dim3 gridDim(k/32, n/32, 1);
 	  
 
-      encode_cols_kernel <<< gridDim,blockDim, 0, THCState_getCurrentStream(state) >>>(
+	  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+      encode_cols_kernel <<< gridDim,blockDim, 0, stream>>>(
             THCudaTensor_data(state, input),
             (unsigned int*)THCudaIntTensor_data(state, output),
             n, k);
@@ -299,7 +306,8 @@ void decode(THCState *state, THCudaIntTensor* input, THCudaTensor* output) {
 
       int count = THCudaIntTensor_nElement(state, input);
 	  
-      decode_rows_kernel <<< GET_BLOCKS(count), CUDA_NUM_THREADS, 0, THCState_getCurrentStream(state) >>>(
+	  cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+      decode_rows_kernel <<< GET_BLOCKS(count), CUDA_NUM_THREADS, 0, stream >>>(
             (unsigned int*)THCudaIntTensor_data(state, input),
             THCudaTensor_data(state, output),
             count);
@@ -324,24 +332,24 @@ void BinarySpatialConvolution_updateOutput(
     THCUNN_assertSameGPU(state, 5, input, output, weight, columns, columns_binary); 
 
     // Params:
-    int nInputPlane = weight->nDimension == 2 ? weight->size[1]/(kH*kW)*32 : weight->size[1];
-    int nOutputPlane = weight->size[0];
+    int nInputPlane = weight->dim() == 2 ? weight->size(1)/(kH*kW)*32 : weight->size(1);
+    int nOutputPlane = weight->size(0);
 
     input = THCudaTensor_newContiguous(state, input);
     int batch = 1;
-    if (input->nDimension == 3) {
+    if (input->dim() == 3) {
         // Force batch
         batch = 0;
-        THCudaTensor_resize4d(state, input, 1, input->size[0], input->size[1], input->size[2]);
+        THCudaTensor_resize4d(state, input, 1, input->size(0), input->size(1), input->size(2));
     }
 
-    long inputWidth   = input->size[3];
-    long inputHeight  = input->size[2];
+    long inputWidth   = input->size(3);
+    long inputHeight  = input->size(2);
     long outputWidth  = (inputWidth + 2*padW - kW) / dW + 1;
     long outputHeight = (inputHeight + 2*padH - kH) / dH + 1;
 
     // Batch size + input planes
-    long batchSize = input->size[0];
+    long batchSize = input->size(0);
 
     // Resize output
     THCudaTensor_resize4d(state, output, batchSize, nOutputPlane, outputHeight, outputWidth);
@@ -350,8 +358,8 @@ void BinarySpatialConvolution_updateOutput(
     THCudaTensor_resize2d(state, columns, nInputPlane*kW*kH, outputHeight*outputWidth); 
 
 	// Resize the weight/columns buffers
-	if (columns_binary->nDimension != 2 || columns_binary->size[0]*columns_binary->size[1] < outputHeight*outputWidth*weight->size[1]) {
-		THCudaIntTensor_resize2d(state, columns_binary, weight->size[1], outputHeight*outputWidth);
+	if (columns_binary->dim() != 2 || columns_binary->size(0)*columns_binary->size(1) < outputHeight*outputWidth*weight->size(1)) {
+		THCudaIntTensor_resize2d(state, columns_binary, weight->size(1), outputHeight*outputWidth);
 	}
 	
     // Helpers
@@ -365,8 +373,9 @@ void BinarySpatialConvolution_updateOutput(
         THCudaTensor_select(state, output_n, output, 0, elt);
 		
         // Extract columns:
+	    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
         im2col(
-            THCState_getCurrentStream(state),
+            stream,
             THCudaTensor_data(state, input_n),
             nInputPlane, inputHeight, inputWidth, kH, kW, padH, padW, dH, dW,
             1, 1, THCudaTensor_data(state, columns)
@@ -375,24 +384,24 @@ void BinarySpatialConvolution_updateOutput(
         // M,N,K are dims of matrix A and B
         // (see http://docs.nvidia.com/cuda/cublas/#cublas-lt-t-gt-gemm)
         // row-major to column-major change
-        int m = weight->size[0];
-        int n = weight->size[1];
-        int k = columns->size[1];
+        int m = weight->size(0);
+        int n = weight->size(1);
+        int k = columns->size(1);
 
 		// Encode cols
 		dim3 blockDim_ck(32, 32, 1);
-		dim3 gridDim_ck(columns->size[1]/32+1, columns->size[0]/32+1, 1);
+		dim3 gridDim_ck(columns->size(1)/32+1, columns->size(0)/32+1, 1);
 
-		encode_cols_kernel <<< gridDim_ck, blockDim_ck, 0, THCState_getCurrentStream(state) >>>(
+		encode_cols_kernel <<< gridDim_ck, blockDim_ck, 0, stream >>>(
 			THCudaTensor_data(state, columns),
 			(unsigned int*)THCudaIntTensor_data(state, columns_binary),
-			columns->size[0], columns->size[1]);
+			columns->size(0), columns->size(1));
 
 		dim3 blockDim(16, 16, 1);
 		dim3 gridDim(k/16+1 , m/16+1);
 			
 		// Do here the binary_gemm call - popcount(XOR) is called here
-		binary_gemm <<<gridDim,blockDim,0,THCState_getCurrentStream(state)>>>(
+		binary_gemm <<<gridDim,blockDim,0, stream>>>(
             (unsigned int*)THCudaIntTensor_data(state, weight),
             (unsigned int*)THCudaIntTensor_data(state, columns_binary), 
             THCudaTensor_data(state, output_n), m, n, k, THCudaTensor_data(state, alphas));
